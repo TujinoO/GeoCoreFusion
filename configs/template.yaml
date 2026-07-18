@@ -1,0 +1,39 @@
+data_dir: 'E:\path\to\one_scan_group'
+output_dir: 'E:\Code\GeoCoreFusion\runs\my_experiment'
+roi:
+  mode: auto  # manual 时同时填写 x、y
+  x: null
+  y: null
+  width: 1024
+  height: 1536
+registration:
+  preview_width: 320
+  preview_max_height: 2048
+  motion: auto_physical
+  strip_count: 10
+spectral:
+  output_start_nm: 691.0
+  output_end_nm: 2518.0
+  output_step_nm: 5.0
+fusion:
+  rank: 12
+  refiner: variational  # 可选 bicubic、variational、neural
+  variational_iterations: 18
+  # v5：先在低秩材料系数中注入与各分量相关的有符号 RGB 细节，
+  # 再使用较弱的全波段增益和加性近零空间细节。设为 0 可恢复 v4 行为。
+  coefficient_detail_strength: 0.0
+  coefficient_detail_ridge: 0.08
+  coefficient_detail_min_correlation: 0.08
+  coefficient_detail_clip_sigma: 0.35
+  coefficient_detail_support_floor: 0.30
+  coefficient_detail_nullspace_iterations: 3
+  coefficient_detail_back_projection_iterations: 3
+  spatial_detail_additive_strength: 0.0
+  spatial_detail_additive_std_fraction: 0.35
+  spatial_detail_additive_mean_fraction: 0.04
+output:
+  overwrite_files: false
+  write_envi: true
+  write_coefficients: true
+  write_previews: true
+  write_uncertainty: true

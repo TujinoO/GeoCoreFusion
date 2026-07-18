@@ -1,0 +1,42 @@
+data_dir: 'E:\Code\GeoCoreFusion\data\2023_09_09_14_18_58-ZKH3号-132-140-0.0_0.0-0.0_0.0'
+output_dir: 'E:\Code\GeoCoreFusion\runs\zkh3_roi_registration_v2'
+roi:
+  mode: manual
+  x: 723
+  y: 9286
+  width: 1024
+  height: 1536
+  auto_candidates: 120
+registration:
+  preview_width: 480
+  preview_max_height: 3072
+  motion: auto_physical
+  ecc_iterations: 300
+  enable_strip_drift: false
+  enable_roi_refinement: true
+  roi_ecc_iterations: 900
+  enable_roi_row_refinement: false
+spectral:
+  output_start_nm: 691.0
+  output_end_nm: 2518.0
+  output_step_nm: 5.0
+fusion:
+  rank: 12
+  max_basis_pixels: 50000
+  refiner: variational
+  variational_iterations: 18
+  diffusion_strength: 0.28
+  anchor_weight: 0.18
+  back_projection_weight: 0.85
+  back_projection_interval: 1
+  reconstruct_tile: 192
+output:
+  overwrite_files: false
+  write_envi: true
+  write_coefficients: true
+  write_previews: true
+  write_uncertainty: true
+project:
+  borehole_id: ZKH3
+  core_interval: 132-140
+  notes: ROI joint-registration v2
