@@ -14,11 +14,17 @@ from .config import PipelineConfig
 from .dataset import DatasetTriplet, discover_triplet, normalize_image, normalize_rgb
 from .degradation import degrade_coefficients, estimate_psf
 from .envi import create_bip_writer, metadata_dict
-from .fusion import build_additive_spectral_scale, refine_coefficients
-from .lowrank import fit_subspace
+from .fusion import (
+    back_project_modulated_product,
+    build_additive_spectral_scale,
+    build_band_adaptive_mtf_detail,
+    refine_coefficients,
+)
+from .lowrank import fit_hybrid_simplex_subspace, fit_simplex_subspace, fit_subspace
 from .output import (
     build_manifest,
     reconstruct_to_envi,
+    write_additive_spectral_scale,
     write_band_metadata,
     write_coefficients_envi,
     write_json,
@@ -72,10 +78,110 @@ def _prepare_dirs(out: Path) -> None:
         (out / name).mkdir(exist_ok=True)
 
 
+def _planned_pipeline_outputs(config: PipelineConfig) -> tuple[Path, ...]:
+    """Enumerate deterministic files that this pipeline run may replace."""
+
+    out = config.output_dir
+    relative_paths = [
+        "manifest.json",
+        "analysis/harmonized_lowres.hdr",
+        "analysis/harmonized_lowres.dat",
+        "metadata/input_metadata.json",
+        "metadata/registration_model.json",
+        "metadata/spectral_harmonization.json",
+        "metadata/band_metadata.csv",
+        "metadata/psf_model.json",
+        "metadata/subspace_model.json",
+        "metadata/additive_spectral_scale.json",
+        "metadata/fusion_model.json",
+        "metadata/processing_config.json",
+        "metrics/quality_report.json",
+    ]
+    if config.output.write_envi:
+        relative_paths.extend(
+            (
+                "cube/fused_continuous_691_2518nm.hdr",
+                "cube/fused_continuous_691_2518nm.dat",
+            )
+        )
+    if config.output.write_coefficients:
+        relative_paths.extend(
+            (
+                "coefficients/material_coefficients.hdr",
+                "coefficients/material_coefficients.dat",
+            )
+        )
+    if config.output.write_uncertainty:
+        relative_paths.extend(
+            (
+                "metrics/spatial_uncertainty.hdr",
+                "metrics/spatial_uncertainty.dat",
+                "metrics/spatial_detail_gain.hdr",
+                "metrics/spatial_detail_gain.dat",
+                "metrics/spatial_additive_detail.hdr",
+                "metrics/spatial_additive_detail.dat",
+            )
+        )
+    if config.output.write_previews:
+        relative_paths.extend(
+            (
+                "previews/rgb_reference.png",
+                "previews/fused_false_color_base_2200_1650_900.png",
+                "previews/fused_false_color_2200_1650_900.png",
+                "previews/fused_2200nm.png",
+                "previews/fused_2350nm.png",
+                "previews/fused_mean_reflectance.png",
+                "previews/uncertainty.png",
+                "previews/spatial_detail_before_after.png",
+                "previews/spatial_detail_gain.png",
+                "previews/spatial_additive_detail.png",
+                "previews/registration_rgb_structure.png",
+                "previews/registration_nir_overlay.png",
+                "previews/registration_swir_overlay.png",
+            )
+        )
+        if config.registration.enable_roi_refinement:
+            relative_paths.extend(
+                (
+                    "previews/registration_nir_roi_before.png",
+                    "previews/registration_nir_roi_after.png",
+                    "previews/registration_swir_roi_before.png",
+                    "previews/registration_swir_roi_after.png",
+                    "previews/registration_nir_swir_overlap_after.png",
+                    "previews/registration_nir_roi_checkerboard.png",
+                    "previews/registration_swir_roi_checkerboard.png",
+                    "previews/registration_nir_tiepoints.png",
+                    "previews/registration_swir_tiepoints.png",
+                    "previews/registration_nir_to_swir_tiepoints.png",
+                    "previews/registration_joint_hsi_tiepoints.png",
+                )
+            )
+    return tuple(out / relative for relative in relative_paths)
+
+
+def _protect_pipeline_outputs(config: PipelineConfig) -> None:
+    if config.output.overwrite_files:
+        return
+    existing = [path for path in _planned_pipeline_outputs(config) if path.exists()]
+    if existing:
+        shown = ", ".join(str(path) for path in existing[:5])
+        suffix = "" if len(existing) <= 5 else f" (and {len(existing) - 5} more)"
+        raise FileExistsError(
+            f"Output file(s) already exist: {shown}{suffix}; enable "
+            "output.overwrite_files to replace explicit files"
+        )
+
+
+def _preview_uint8(image: np.ndarray) -> np.ndarray:
+    normalized = normalize_image(image)
+    normalized = np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0)
+    return (np.clip(normalized, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+
 def _save_registration_previews(bundle: RegistrationBundle, preview_dir: Path) -> None:
-    rgb = (normalize_image(bundle.preview_rgb) * 255).round().astype(np.uint8)
-    nir = (normalize_image(bundle.preview_nir_aligned) * 255).round().astype(np.uint8)
-    swir = (normalize_image(bundle.preview_swir_aligned) * 255).round().astype(np.uint8)
+    rgb = _preview_uint8(bundle.preview_rgb)
+    nir = _preview_uint8(bundle.preview_nir_aligned)
+    swir = _preview_uint8(bundle.preview_swir_aligned)
     Image.fromarray(rgb).save(preview_dir / "registration_rgb_structure.png")
     Image.fromarray(np.stack([rgb, nir, ((rgb.astype(np.float32) + nir) * 0.5).astype(np.uint8)], axis=2)).save(preview_dir / "registration_nir_overlay.png")
     Image.fromarray(np.stack([rgb, swir, ((rgb.astype(np.float32) + swir) * 0.5).astype(np.uint8)], axis=2)).save(preview_dir / "registration_swir_overlay.png")
@@ -99,7 +205,7 @@ def _save_pair_overlay(path: Path, reference: np.ndarray, moving: np.ndarray, *,
     ref = _registration_edge(reference) if edges else normalize_image(reference)
     mov = _registration_edge(moving) if edges else normalize_image(moving)
     overlay = np.stack([ref, mov, 0.5 * (ref + mov)], axis=2)
-    Image.fromarray((_preview_resize(np.clip(overlay, 0, 1)) * 255).round().astype(np.uint8)).save(path)
+    Image.fromarray(_preview_uint8(_preview_resize(np.clip(overlay, 0, 1)))).save(path)
 
 
 def _save_checkerboard(path: Path, reference: np.ndarray, moving: np.ndarray, block: int = 24) -> None:
@@ -108,11 +214,11 @@ def _save_checkerboard(path: Path, reference: np.ndarray, moving: np.ndarray, bl
     yy, xx = np.indices(ref.shape)
     mask = ((yy // block + xx // block) % 2).astype(bool)
     board = np.where(mask, ref, mov)
-    Image.fromarray((_preview_resize(board) * 255).round().astype(np.uint8)).save(path)
+    Image.fromarray(_preview_uint8(_preview_resize(board))).save(path)
 
 
 def _save_tiepoint_vectors(path: Path, reference: np.ndarray, details: dict[str, Any]) -> None:
-    base = (_preview_resize(normalize_image(reference)) * 255).round().astype(np.uint8)
+    base = _preview_uint8(_preview_resize(reference))
     canvas = Image.fromarray(base).convert("RGB")
     draw = ImageDraw.Draw(canvas)
     scale_x = canvas.width / float(reference.shape[1])
@@ -274,12 +380,11 @@ def run_registration_review(config: PipelineConfig) -> RegistrationReviewResult:
 
 def run_pipeline(config: PipelineConfig) -> PipelineResult:
     np.random.seed(config.fusion.random_seed)
-    dataset = discover_triplet(config.data_dir)
     out = config.output_dir
+    _protect_pipeline_outputs(config)
     _prepare_dirs(out)
+    dataset = discover_triplet(config.data_dir)
     fused_hdr = out / "cube" / "fused_continuous_691_2518nm.hdr"
-    if fused_hdr.exists() and not config.output.overwrite_files:
-        raise FileExistsError(f"Output already exists: {fused_hdr}; enable output.overwrite_files to replace explicit files")
 
     registration = estimate_registration(dataset, config.registration)
     roi = choose_roi(config.roi, registration, dataset.rgb.meta.shape[:2])
@@ -312,14 +417,57 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     )
     hsi_structure = normalize_image(np.nanmean(spectral.cube, axis=2))
     psf = estimate_psf(rgb_crop, hsi_structure, config.degradation)
-    subspace, low_coeff = fit_subspace(
-        spectral.cube,
-        rank=config.fusion.rank,
-        max_pixels=config.fusion.max_basis_pixels,
-        random_seed=config.fusion.random_seed,
-        clip_quantiles=config.fusion.clip_quantiles,
-    )
+    factorization_method = str(config.fusion.factorization_method).strip().lower()
+    if factorization_method in {"pca", "randomized_svd", "svd"}:
+        subspace, low_coeff = fit_subspace(
+            spectral.cube,
+            rank=config.fusion.rank,
+            max_pixels=config.fusion.max_basis_pixels,
+            random_seed=config.fusion.random_seed,
+            clip_quantiles=config.fusion.clip_quantiles,
+        )
+    elif factorization_method in {
+        "simplex_nmf",
+        "simplex",
+        "nonnegative_simplex",
+    }:
+        subspace, low_coeff = fit_simplex_subspace(
+            spectral.cube,
+            rank=config.fusion.rank,
+            max_pixels=config.fusion.max_basis_pixels,
+            random_seed=config.fusion.random_seed,
+            clip_quantiles=config.fusion.clip_quantiles,
+            max_iterations=config.fusion.simplex_factorization_iterations,
+            tolerance=config.fusion.simplex_factorization_tolerance,
+        )
+        config.fusion.coefficient_constraint = "simplex"
+    elif factorization_method in {
+        "hybrid_simplex_residual",
+        "simplex_plus_residual",
+        "uarf_hybrid",
+    }:
+        subspace, low_coeff = fit_hybrid_simplex_subspace(
+            spectral.cube,
+            rank=config.fusion.rank,
+            residual_rank=config.fusion.simplex_residual_rank,
+            max_pixels=config.fusion.max_basis_pixels,
+            random_seed=config.fusion.random_seed,
+            clip_quantiles=config.fusion.clip_quantiles,
+            max_iterations=config.fusion.simplex_factorization_iterations,
+            tolerance=config.fusion.simplex_factorization_tolerance,
+        )
+        config.fusion.coefficient_constraint = "hybrid_simplex"
+    else:
+        raise ValueError(
+            f"Unknown fusion factorization_method "
+            f"{config.fusion.factorization_method!r}"
+        )
     fusion = refine_coefficients(low_coeff, rgb_crop, psf, config.fusion)
+    fusion.details["factorization"] = {
+        "configured_method": factorization_method,
+        "representation": str(subspace.representation),
+        "fit_metadata": dict(subspace.fit_metadata),
+    }
     selected_rmse = float(np.sqrt(np.mean((degrade_coefficients(fusion.coefficients, psf) - low_coeff) ** 2)))
     safety_trials = [{"psf_factor": 1.0, "coefficient_rmse": selected_rmse}]
     if selected_rmse > config.fusion.safety_observation_rmse:
@@ -343,11 +491,53 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 break
         selected_rmse, psf, fusion = best
     fusion.details["psf_safety_trials"] = safety_trials
-    fusion.details["selected_coefficient_rmse"] = selected_rmse
-    additive_spectral_scale = build_additive_spectral_scale(spectral.cube, config.fusion)
+    fusion.details["selected_coefficient_rmse_pre_product_cycle"] = selected_rmse
+    additive_mode = str(config.fusion.spatial_detail_additive_mode).strip().lower()
+    if additive_mode in {"band_adaptive_mtf_gsa", "mtf_gsa", "band_adaptive"}:
+        (
+            fusion.additive_detail_map,
+            additive_spectral_scale,
+            additive_details,
+        ) = build_band_adaptive_mtf_detail(
+            spectral.cube,
+            rgb_crop,
+            psf,
+            config.fusion,
+        )
+        fusion.details["spatial_detail"]["additive_model"] = additive_details
+    elif additive_mode in {"legacy", "shared", "none"}:
+        additive_spectral_scale = build_additive_spectral_scale(
+            spectral.cube, config.fusion
+        )
+    else:
+        raise ValueError(
+            f"Unknown spatial_detail_additive_mode "
+            f"{config.fusion.spatial_detail_additive_mode!r}"
+        )
     fusion.details["spatial_detail"]["additive_spectral_scale_min"] = float(np.min(additive_spectral_scale))
     fusion.details["spatial_detail"]["additive_spectral_scale_max"] = float(np.max(additive_spectral_scale))
     fusion.details["spatial_detail"]["additive_spectral_scale_mean"] = float(np.mean(additive_spectral_scale))
+    fusion.coefficients, product_cycle = back_project_modulated_product(
+        fusion.coefficients,
+        low_coeff,
+        spectral.cube,
+        subspace.basis,
+        subspace.mean_spectrum,
+        fusion.detail_gain_map,
+        fusion.additive_detail_map,
+        additive_spectral_scale,
+        psf,
+        config.fusion,
+    )
+    fusion.details["spatial_detail"]["final_product_observation_cycle"] = product_cycle
+    final_coefficient_rmse = float(
+        np.sqrt(
+            np.mean(
+                (degrade_coefficients(fusion.coefficients, psf) - low_coeff) ** 2
+            )
+        )
+    )
+    fusion.details["selected_coefficient_rmse"] = final_coefficient_rmse
     quality = build_quality_report(
         fusion.coefficients,
         low_coeff,
@@ -393,6 +583,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     quality["subspace"] = {
         "rank": int(subspace.basis.shape[0]),
         "explained_variance_total": float(subspace.explained_variance_ratio.sum()),
+        "representation": str(subspace.representation),
+        "fit_metadata": dict(subspace.fit_metadata),
     }
 
     outputs: dict[str, str] = {}
@@ -450,17 +642,60 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             previews.update(_save_roi_registration_previews(roi_registration, out / "previews"))
 
     write_json(out / "metadata" / "input_metadata.json", input_summary(dataset))
+    outputs["input_metadata_json"] = "metadata/input_metadata.json"
     registration_metadata: dict[str, Any] = {"full_scan_coarse": registration.to_dict()}
     if roi_registration is not None:
         registration_metadata["roi_refinement"] = roi_registration.to_dict()
     write_json(out / "metadata" / "registration_model.json", registration_metadata)
+    outputs["registration_model_json"] = "metadata/registration_model.json"
     write_json(out / "metadata" / "spectral_harmonization.json", spectral.model)
+    outputs["spectral_harmonization_json"] = "metadata/spectral_harmonization.json"
     write_band_metadata(out / "metadata" / "band_metadata.csv", spectral.band_metadata)
+    outputs["band_metadata_csv"] = "metadata/band_metadata.csv"
     write_json(out / "metadata" / "psf_model.json", psf.to_dict())
-    write_json(out / "metadata" / "subspace_model.json", subspace.to_dict())
+    outputs["psf_model_json"] = "metadata/psf_model.json"
+    subspace_payload = subspace.to_dict()
+    subspace_payload["source_metadata"] = {
+        "derived_from": [
+            "analysis/harmonized_lowres.hdr",
+            "metadata/spectral_harmonization.json",
+            "metadata/band_metadata.csv",
+        ],
+        "processing_config": "metadata/processing_config.json",
+        "algorithm": str(
+            subspace.fit_metadata.get(
+                "algorithm",
+                "randomized_svd"
+                if factorization_method in {"pca", "randomized_svd", "svd"}
+                else factorization_method,
+            )
+        ),
+        "representation": str(subspace.representation),
+        "random_seed": int(config.fusion.random_seed),
+    }
+    write_json(out / "metadata" / "subspace_model.json", subspace_payload)
+    outputs["subspace_model_json"] = "metadata/subspace_model.json"
+    write_additive_spectral_scale(
+        out / "metadata" / "additive_spectral_scale.json",
+        spectral.wavelengths_nm,
+        additive_spectral_scale,
+        source_metadata={
+            "derived_from": [
+                "analysis/harmonized_lowres.hdr",
+                "metadata/spectral_harmonization.json",
+            ],
+            "fusion_model": "metadata/fusion_model.json",
+            "method": additive_mode,
+        },
+    )
+    outputs["additive_spectral_scale_json"] = "metadata/additive_spectral_scale.json"
     write_json(out / "metadata" / "fusion_model.json", {"details": fusion.details, "history": fusion.history})
+    outputs["fusion_model_json"] = "metadata/fusion_model.json"
     write_json(out / "metadata" / "processing_config.json", config.to_dict())
+    outputs["processing_config_json"] = "metadata/processing_config.json"
     write_json(out / "metrics" / "quality_report.json", quality)
+    outputs["quality_report_json"] = "metrics/quality_report.json"
+    outputs["run_manifest_json"] = "manifest.json"
     manifest = build_manifest(config, roi, spectral.wavelengths_nm, outputs, previews)
     write_json(out / "manifest.json", manifest)
     return PipelineResult(output_dir=out, manifest=manifest, quality_report=quality, roi=roi)

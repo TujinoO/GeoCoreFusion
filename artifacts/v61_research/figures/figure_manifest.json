@@ -1,0 +1,22 @@
+{
+  "schema": "geocorefusion.v61-figure-manifest.v1",
+  "figures": [
+    "01_v61_visual_full_detail_route.png",
+    "01_v61_visual_full_detail_route.pdf",
+    "02_3dssz_v6_v61_shared_domain_comparison.png",
+    "02_3dssz_v6_v61_shared_domain_comparison.pdf",
+    "03_zkh3_v6_v61_shared_domain_comparison.png",
+    "03_zkh3_v6_v61_shared_domain_comparison.pdf",
+    "04_v6_v61_key_metric_improvement.png",
+    "04_v6_v61_key_metric_improvement.pdf",
+    "05_v61_detail_amplitude_and_residual_audit.png",
+    "05_v61_detail_amplitude_and_residual_audit.pdf",
+    "06_v61_low_resolution_spectral_curve_consistency.png",
+    "06_v61_low_resolution_spectral_curve_consistency.pdf",
+    "07_v61_registration_residual_control.png",
+    "07_v61_registration_residual_control.pdf",
+    "08_v61_single_product_and_claim_contract.png",
+    "08_v61_single_product_and_claim_contract.pdf"
+  ],
+  "benchmark_summary": "artifacts\\v61_research\\experiments\\benchmark_summary.json"
+}

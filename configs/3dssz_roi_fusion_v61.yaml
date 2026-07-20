@@ -1,0 +1,81 @@
+data_dir: 'E:\Code\GeoCoreFusion\data\2023_09_04_14_34_41-3DSSZ-1-16-267.0_276.0-532.0_552.0'
+output_dir: 'E:\Code\GeoCoreFusion\runs\3dssz_roi_fusion_v61'
+roi:
+  mode: manual
+  x: 482
+  y: 7942
+  width: 1024
+  height: 1536
+registration:
+  preview_width: 480
+  preview_max_height: 3072
+  motion: auto_physical
+  ecc_iterations: 300
+  enable_strip_drift: false
+  enable_roi_refinement: true
+  roi_ecc_iterations: 900
+  enable_roi_column_geometry_refinement: true
+  enable_roi_tiepoint_refinement: true
+  roi_tiepoint_grid_rows: 13
+  roi_tiepoint_grid_cols: 8
+  roi_tiepoint_template_radius: 7
+  roi_tiepoint_search_radius: 8
+  enable_roi_row_refinement: false
+spectral:
+  output_start_nm: 691.0
+  output_end_nm: 2518.0
+  output_step_nm: 5.0
+degradation:
+  estimate_psf: true
+fusion:
+  rank: 12
+  max_basis_pixels: 50000
+  refiner: variational
+  variational_iterations: 18
+  diffusion_strength: 0.20
+  anchor_weight: 0.25
+  guided_radius: 7
+  guided_epsilon: 0.0018
+  boundary_injection_strength: 1.05
+  coefficient_detail_strength: 0.0
+  intrinsic_detail_enabled: true
+  intrinsic_log_epsilon: 0.0039215686
+  dark_detail_percentile: 25.0
+  spatial_detail_method: visual_multiscale_gradient
+  spatial_detail_strength: 0.92
+  spatial_detail_gain_limits: [0.52, 1.92]
+  spatial_detail_log_gain: true
+  spatial_detail_log_detail_clip: 0.55
+  spatial_detail_amplitude_recovery_limit: 2.0
+  spatial_detail_confidence_mode: none
+  spatial_detail_nullspace_iterations: 2
+  spatial_detail_additive_mode: legacy
+  spatial_detail_additive_strength: 0.22
+  spatial_detail_additive_std_fraction: 0.35
+  spatial_detail_additive_mean_fraction: 0.04
+  spatial_detail_product_back_projection_iterations: 4
+  spatial_detail_product_back_projection_weight: 0.80
+  spatial_detail_product_back_projection_clip_sigma: 0.65
+  visual_detail_denoise_strength: 0.55
+  visual_detail_pyramid_sigmas: [0.65, 1.35, 2.80, 5.60]
+  visual_detail_pyramid_weights: [1.15, 1.00, 0.82, 0.58]
+  visual_detail_chroma_weight: 0.35
+  visual_detail_poisson_screen: 0.24
+  visual_detail_gradient_weight: 1.0
+  visual_detail_dark_boost: 0.25
+  visual_detail_sharpen_strength: 0.25
+  visual_detail_reflect_padding: 24
+  back_projection_weight: 0.88
+  back_projection_interval: 1
+  reconstruct_tile: 192
+output:
+  overwrite_files: false
+  write_envi: false
+  write_coefficients: false
+  write_previews: true
+  write_uncertainty: true
+  product_mode: visual_full_detail
+project:
+  borehole_id: 3DSSZ-1-16
+  core_interval: 267.0-276.0 / 532.0-552.0
+  notes: V6.1 single visual-full-detail product; denoised RGB pyramid plus gradient reconstruction, observation back-projection and controlled sharpening

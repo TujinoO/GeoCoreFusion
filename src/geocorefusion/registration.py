@@ -196,13 +196,39 @@ class RoiRegistrationBundle:
         }
 
 
+def _feature_base_and_support(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize finite pixels while keeping an explicit invalid-data support mask."""
+
+    values = np.asarray(image, dtype=np.float32)
+    valid = np.isfinite(values)
+    if not valid.any():
+        return np.zeros(values.shape, dtype=np.uint8), valid
+    normalized = normalize_image(values)
+    fill = float(np.median(normalized[valid]))
+    filled = np.where(valid, normalized, fill)
+    support = valid.copy()
+    if not valid.all():
+        # Feature operators have a small spatial footprint. Excluding a two-pixel
+        # halo prevents the finite fill from becoming an artificial boundary edge.
+        invalid_halo = cv2.dilate((~valid).astype(np.uint8), np.ones((5, 5), dtype=np.uint8))
+        support &= invalid_halo == 0
+    base = (np.clip(filled, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    return base, support
+
+
 def _feature(image: np.ndarray) -> np.ndarray:
-    base = (normalize_image(image) * 255.0).round().astype(np.uint8)
+    base, support = _feature_base_and_support(image)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(base).astype(np.float32) / 255.0
     gx = cv2.Sobel(clahe, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(clahe, cv2.CV_32F, 0, 1, ksize=3)
-    grad = normalize_image(cv2.magnitude(gx, gy))
-    return normalize_image(0.35 * clahe + 0.65 * grad)
+    magnitude = cv2.magnitude(gx, gy)
+    magnitude[~support] = np.nan
+    grad = normalize_image(magnitude)
+    combined = 0.35 * clahe + 0.65 * np.nan_to_num(grad, nan=0.0)
+    combined[~support] = np.nan
+    feature = normalize_image(combined)
+    feature[~support] = np.nan
+    return feature
 
 
 def _corr(a: np.ndarray, b: np.ndarray) -> float:
@@ -217,37 +243,104 @@ def _corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sum(aa * bb) / denom) if denom > 1e-9 else float("nan")
 
 
+def _finite_cv_pair(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return finite OpenCV inputs plus their shared, scoreable support."""
+
+    aa = np.asarray(a, dtype=np.float32)
+    bb = np.asarray(b, dtype=np.float32)
+    valid = np.isfinite(aa) & np.isfinite(bb)
+    return (
+        np.where(np.isfinite(aa), aa, 0.0).astype(np.float32),
+        np.where(np.isfinite(bb), bb, 0.0).astype(np.float32),
+        valid,
+    )
+
+
 def _modality_feature(image: np.ndarray) -> np.ndarray:
     """Build an edge-proximity representation that is stable across RGB/NIR/SWIR."""
 
-    finite = np.nan_to_num(np.asarray(image, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    base = (normalize_image(finite) * 255.0).round().astype(np.uint8)
+    base, support = _feature_base_and_support(image)
     tile = (max(2, min(8, base.shape[1] // 20)), max(2, min(8, base.shape[0] // 20)))
     contrast = cv2.createCLAHE(clipLimit=2.0, tileGridSize=tile).apply(base).astype(np.float32) / 255.0
     gx = cv2.Scharr(contrast, cv2.CV_32F, 1, 0)
     gy = cv2.Scharr(contrast, cv2.CV_32F, 0, 1)
-    gradient = normalize_image(cv2.magnitude(gx, gy))
-    threshold = float(np.percentile(gradient, 72.0))
-    edges = (gradient >= max(threshold, 0.05)).astype(np.uint8)
+    magnitude = cv2.magnitude(gx, gy)
+    magnitude[~support] = np.nan
+    gradient = normalize_image(magnitude)
+    finite_gradient = gradient[support & np.isfinite(gradient)]
+    threshold = float(np.percentile(finite_gradient, 72.0)) if finite_gradient.size else 1.0
+    edges = ((gradient >= max(threshold, 0.05)) & support).astype(np.uint8)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
     distance = cv2.distanceTransform(1 - edges, cv2.DIST_L2, 3)
     proximity = np.exp(-distance / 2.5).astype(np.float32)
-    laplacian = normalize_image(np.abs(cv2.Laplacian(contrast, cv2.CV_32F, ksize=3)))
-    return normalize_image(
+    laplacian_raw = np.abs(cv2.Laplacian(contrast, cv2.CV_32F, ksize=3))
+    laplacian_raw[~support] = np.nan
+    laplacian = normalize_image(laplacian_raw)
+    combined = (
         0.62 * proximity
-        + 0.28 * cv2.GaussianBlur(gradient, (0, 0), 0.8)
-        + 0.10 * cv2.GaussianBlur(laplacian, (0, 0), 0.8)
+        + 0.28 * cv2.GaussianBlur(np.nan_to_num(gradient, nan=0.0), (0, 0), 0.8)
+        + 0.10 * cv2.GaussianBlur(np.nan_to_num(laplacian, nan=0.0), (0, 0), 0.8)
+    )
+    combined[~support] = np.nan
+    feature = normalize_image(combined)
+    feature[~support] = np.nan
+    return feature
+
+
+def _warp_validity(
+    valid: np.ndarray,
+    matrix: np.ndarray,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    return cv2.warpAffine(
+        np.asarray(valid, dtype=np.float32),
+        np.asarray(matrix[:2], dtype=np.float32),
+        (shape[1], shape[0]),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
     )
 
 
 def _warp_affine(image: np.ndarray, matrix: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    return cv2.warpAffine(
-        np.asarray(image, dtype=np.float32),
+    source = np.asarray(image, dtype=np.float32)
+    valid = np.isfinite(source)
+    warped = cv2.warpAffine(
+        np.where(valid, source, 0.0).astype(np.float32),
         np.asarray(matrix[:2], dtype=np.float32),
         (shape[1], shape[0]),
         flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-        borderMode=cv2.BORDER_REFLECT101,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
     )
+    warped_validity = _warp_validity(valid, matrix, shape)
+    warped[warped_validity < 1.0 - 1e-6] = np.nan
+    return warped
+
+
+def _remap_preserve_invalid(image: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarray:
+    """Remap without synthesizing image content outside finite source support."""
+
+    source = np.asarray(image, dtype=np.float32)
+    valid = np.isfinite(source)
+    remapped = cv2.remap(
+        np.where(valid, source, 0.0).astype(np.float32),
+        np.asarray(map_x, dtype=np.float32),
+        np.asarray(map_y, dtype=np.float32),
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    remapped_validity = cv2.remap(
+        valid.astype(np.float32),
+        np.asarray(map_x, dtype=np.float32),
+        np.asarray(map_y, dtype=np.float32),
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    remapped[remapped_validity < 1.0 - 1e-6] = np.nan
+    return remapped
 
 
 def _sample_dense_map(field: np.ndarray, y: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -298,7 +391,11 @@ def _estimate_roi_affine(
     ref_feature = _modality_feature(reference)
     moving_feature = _modality_feature(moving)
     before = _corr(ref_feature, moving_feature)
-    shift, phase_response = cv2.phaseCorrelate(ref_feature, moving_feature)
+    ref_cv, moving_cv, cv_support = _finite_cv_pair(ref_feature, moving_feature)
+    if int(cv_support.sum()) >= 32:
+        shift, phase_response = cv2.phaseCorrelate(ref_cv, moving_cv, cv_support.astype(np.float32))
+    else:
+        shift, phase_response = (0.0, 0.0), 0.0
     starts = [
         np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
         np.asarray([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]], dtype=np.float32),
@@ -319,12 +416,12 @@ def _estimate_roi_affine(
             warp = start.copy()
             try:
                 ecc, warp = cv2.findTransformECC(
-                    ref_feature,
-                    moving_feature,
+                    ref_cv,
+                    moving_cv,
                     warp,
                     motion,
                     criteria,
-                    None,
+                    (cv_support.astype(np.uint8) * 255),
                     int(config.gaussian_filter_size),
                 )
             except cv2.error:
@@ -334,6 +431,8 @@ def _estimate_roi_affine(
                 continue
             aligned = _warp_affine(moving_feature, matrix, shape)
             correlation = _corr(ref_feature, aligned)
+            if not np.isfinite(correlation):
+                continue
             candidates.append((float(correlation - penalty), float(ecc), matrix, aligned, name))
 
     identity = np.eye(3, dtype=np.float64)
@@ -391,13 +490,7 @@ def _row_warp_image(
         yy = yy + dy[:, None]
     mapped_x = matrix[0, 0] * xx + matrix[0, 1] * yy + matrix[0, 2]
     mapped_y = matrix[1, 0] * xx + matrix[1, 1] * yy + matrix[1, 2]
-    return cv2.remap(
-        np.asarray(image, dtype=np.float32),
-        mapped_x.astype(np.float32),
-        mapped_y.astype(np.float32),
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT101,
-    )
+    return _remap_preserve_invalid(image, mapped_x, mapped_y)
 
 
 def _column_line_profile(image: np.ndarray) -> np.ndarray:
@@ -565,12 +658,10 @@ def _estimate_row_refinement(
         scored: list[tuple[float, int, int]] = []
         for dy in range(-radius, radius + 1):
             for dx in range(-radius, radius + 1):
-                sampled = cv2.remap(
+                sampled = _remap_preserve_invalid(
                     aligned_feature,
                     xx + float(dx),
                     yy + float(dy),
-                    interpolation=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_REFLECT101,
                 )[:, margin : width - margin]
                 scored.append((_corr(ref_patch, sampled), dx, dy))
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -632,12 +723,12 @@ def _tiepoint_subpixel_peak(response: np.ndarray, py: int, px: int) -> tuple[flo
     if 0 < px < response.shape[1] - 1:
         left, center, right = map(float, response[py, px - 1 : px + 2])
         denominator = left - 2.0 * center + right
-        if abs(denominator) > 1e-6:
+        if np.isfinite([left, center, right]).all() and abs(denominator) > 1e-6:
             dx = float(np.clip(0.5 * (left - right) / denominator, -0.75, 0.75))
     if 0 < py < response.shape[0] - 1:
         top, center, bottom = map(float, response[py - 1 : py + 2, px])
         denominator = top - 2.0 * center + bottom
-        if abs(denominator) > 1e-6:
+        if np.isfinite([top, center, bottom]).all() and abs(denominator) > 1e-6:
             dy = float(np.clip(0.5 * (top - bottom) / denominator, -0.75, 0.75))
     return dy, dx
 
@@ -659,22 +750,45 @@ def _match_tiepoint_one(
         or x + radius >= reference.shape[1]
     ):
         return None
-    template = reference[y - radius : y + radius + 1, x - radius : x + radius + 1]
+    template = np.asarray(
+        reference[y - radius : y + radius + 1, x - radius : x + radius + 1],
+        dtype=np.float32,
+    )
+    if not np.isfinite(template).all():
+        return None
     if float(np.std(template)) < 0.035:
         return None
     y0 = max(0, y - radius - search_radius)
     y1 = min(moving.shape[0], y + radius + search_radius + 1)
     x0 = max(0, x - radius - search_radius)
     x1 = min(moving.shape[1], x + radius + search_radius + 1)
-    search = moving[y0:y1, x0:x1]
+    search = np.asarray(moving[y0:y1, x0:x1], dtype=np.float32)
     if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
         return None
-    response = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-    _, score, _, location = cv2.minMaxLoc(response)
-    px, py = location
+    search_valid = np.isfinite(search)
+    response = cv2.matchTemplate(
+        np.where(search_valid, search, 0.0).astype(np.float32),
+        template,
+        cv2.TM_CCOEFF_NORMED,
+    )
+    support = cv2.matchTemplate(
+        search_valid.astype(np.float32),
+        np.ones(template.shape, dtype=np.float32),
+        cv2.TM_CCORR,
+    )
+    response[support < float(template.size) - 0.5] = -np.inf
+    if not np.isfinite(response).any():
+        return None
+    py, px = np.unravel_index(int(np.argmax(response)), response.shape)
+    score = float(response[py, px])
+    # A peak on the response boundary says only that the optimum lies outside
+    # the tested search window; it cannot support a subpixel displacement.
+    if py == 0 or px == 0 or py == response.shape[0] - 1 or px == response.shape[1] - 1:
+        return None
     suppressed = response.copy()
     suppressed[max(0, py - 1) : py + 2, max(0, px - 1) : px + 2] = -1.0
-    second = float(np.max(suppressed)) if suppressed.size > 9 else -1.0
+    finite_suppressed = suppressed[np.isfinite(suppressed)]
+    second = float(np.max(finite_suppressed)) if finite_suppressed.size > 9 else -1.0
     sub_y, sub_x = _tiepoint_subpixel_peak(response, py, px)
     moving_y = y0 + py + sub_y + radius
     moving_x = x0 + px + sub_x + radius
@@ -809,12 +923,10 @@ def _warp_aligned_residual(
     factor: float,
 ) -> np.ndarray:
     yy, xx = np.indices(image.shape, dtype=np.float32)
-    return cv2.remap(
-        np.asarray(image, dtype=np.float32),
+    return _remap_preserve_invalid(
+        image,
         xx + float(factor) * np.asarray(shift_x, dtype=np.float32),
         yy + float(factor) * np.asarray(shift_y, dtype=np.float32),
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT101,
     )
 
 
@@ -938,8 +1050,11 @@ def _mean_selected_bands(
     finite = np.isfinite(sampled)
     count = finite.sum(axis=2)
     total = np.where(finite, sampled, 0.0).sum(axis=2)
-    mean = np.divide(total, count, out=np.zeros_like(total, dtype=np.float32), where=count > 0)
-    return normalize_image(np.nan_to_num(mean, nan=0.0, posinf=0.0, neginf=0.0))
+    mean = np.full_like(total, np.nan, dtype=np.float32)
+    np.divide(total, count, out=mean, where=count > 0)
+    normalized = normalize_image(mean)
+    normalized[count == 0] = np.nan
+    return normalized
 
 
 def estimate_roi_registration(
@@ -1368,6 +1483,14 @@ def refined_analysis_rgb_grid(
     return rgb_y.astype(np.float32), rgb_x.astype(np.float32)
 
 
+def _endpoint_coordinate_scale(source_size: int, target_size: int) -> float:
+    """Scale pixel-center coordinates while mapping both raster endpoints exactly."""
+
+    if source_size <= 1 or target_size <= 1:
+        return 0.0
+    return (float(target_size) - 1.0) / (float(source_size) - 1.0)
+
+
 def _estimate_one(
     rgb_preview: np.ndarray,
     sensor_structure: np.ndarray,
@@ -1383,7 +1506,11 @@ def _estimate_one(
     moving_feature = _feature(moving)
 
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, int(config.ecc_iterations), float(config.ecc_epsilon))
-    shift, phase_response = cv2.phaseCorrelate(template_feature, moving_feature)
+    template_cv, moving_cv, cv_support = _finite_cv_pair(template_feature, moving_feature)
+    if int(cv_support.sum()) >= 32:
+        shift, phase_response = cv2.phaseCorrelate(template_cv, moving_cv, cv_support.astype(np.float32))
+    else:
+        shift, phase_response = (0.0, 0.0), 0.0
     initial_translation = np.array([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]], dtype=np.float32)
     requested = config.motion.lower()
     candidate_types = [cv2.MOTION_TRANSLATION, cv2.MOTION_EUCLIDEAN, cv2.MOTION_AFFINE] if requested in {"auto", "auto_physical"} else [
@@ -1394,12 +1521,12 @@ def _estimate_one(
         candidate = initial_translation.copy()
         try:
             ecc, candidate = cv2.findTransformECC(
-                template_feature,
-                moving_feature,
+                template_cv,
+                moving_cv,
                 candidate,
                 motion,
                 criteria,
-                None,
+                (cv_support.astype(np.uint8) * 255),
                 int(config.gaussian_filter_size),
             )
         except cv2.error:
@@ -1413,14 +1540,10 @@ def _estimate_one(
         )
         if requested == "auto_physical" and not physical:
             continue
-        aligned_candidate = cv2.warpAffine(
-            moving_feature,
-            candidate,
-            (width, height),
-            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
+        aligned_candidate = _warp_affine(moving_feature, candidate, (height, width))
         correlation = _corr(template_feature, aligned_candidate)
+        if not np.isfinite(correlation):
+            continue
         complexity_penalty = 0.006 * (motion == cv2.MOTION_EUCLIDEAN) + 0.012 * (motion == cv2.MOTION_AFFINE)
         candidates.append((float(correlation - complexity_penalty), float(ecc), candidate.copy(), aligned_candidate))
     if candidates:
@@ -1428,21 +1551,23 @@ def _estimate_one(
     else:
         warp = initial_translation
         ecc_score = float(phase_response)
-        aligned = cv2.warpAffine(
-            moving_feature,
-            warp,
-            (width, height),
-            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
+        aligned = _warp_affine(moving_feature, warp, (height, width))
 
     rgb_to_preview = np.array(
-        [[width / float(rgb_shape[1]), 0.0, 0.0], [0.0, height / float(rgb_shape[0]), 0.0], [0.0, 0.0, 1.0]],
+        [
+            [_endpoint_coordinate_scale(rgb_shape[1], width), 0.0, 0.0],
+            [0.0, _endpoint_coordinate_scale(rgb_shape[0], height), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
         dtype=np.float64,
     )
     warp3 = np.vstack([warp.astype(np.float64), [0.0, 0.0, 1.0]])
     preview_to_sensor = np.array(
-        [[sensor_shape[1] / float(width), 0.0, 0.0], [0.0, sensor_shape[0] / float(height), 0.0], [0.0, 0.0, 1.0]],
+        [
+            [_endpoint_coordinate_scale(width, sensor_shape[1]), 0.0, 0.0],
+            [0.0, _endpoint_coordinate_scale(height, sensor_shape[0]), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
         dtype=np.float64,
     )
     raw_matrix = preview_to_sensor @ warp3 @ rgb_to_preview
@@ -1462,15 +1587,20 @@ def _estimate_one(
             ref_strip = template_feature[y0:y1]
             mov_strip = aligned[y0:y1]
             window = cv2.createHanningWindow((width, y1 - y0), cv2.CV_32F)
-            shift, response = cv2.phaseCorrelate(ref_strip, mov_strip, window)
+            ref_cv, mov_cv, strip_support = _finite_cv_pair(ref_strip, mov_strip)
+            window *= strip_support.astype(np.float32)
+            if int(strip_support.sum()) >= 32:
+                shift, response = cv2.phaseCorrelate(ref_cv, mov_cv, window)
+            else:
+                shift, response = (0.0, 0.0), 0.0
             dx_preview = float(np.clip(shift[0], -config.strip_max_shift_preview_px, config.strip_max_shift_preview_px))
             dy_preview = float(np.clip(shift[1], -config.strip_max_shift_preview_px, config.strip_max_shift_preview_px))
             if not np.isfinite(response) or response < 0.02:
                 dx_preview = dy_preview = 0.0
             correction_input_preview = linear @ np.asarray([dx_preview, dy_preview], dtype=np.float64)
-            drift_y.append(float(center * rgb_shape[0] / height))
-            drift_dx.append(float(correction_input_preview[0] * sensor_shape[1] / width))
-            drift_dy.append(float(correction_input_preview[1] * sensor_shape[0] / height))
+            drift_y.append(float(center * _endpoint_coordinate_scale(height, rgb_shape[0])))
+            drift_dx.append(float(correction_input_preview[0] * _endpoint_coordinate_scale(width, sensor_shape[1])))
+            drift_dy.append(float(correction_input_preview[1] * _endpoint_coordinate_scale(height, sensor_shape[0])))
 
     if drift_y:
         dx_array = np.asarray(drift_dx, dtype=np.float64)
